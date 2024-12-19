@@ -1,0 +1,6 @@
+nltk
+pandas
+scikit-learn
+joblib
+tkinter
+TurkishStemmer
