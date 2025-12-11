@@ -1,0 +1,25 @@
+# --- Güvenlik (ÇOK ÖNEMLİ) ---
+.env
+.env.local
+api_keys.txt
+
+# --- Python Gereksiz Dosyaları ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- Sanal Ortamlar (Varsa) ---
+venv/
+env/
+.venv/
+.env/
+
+# --- İşletim Sistemi Dosyaları ---
+.DS_Store
+Thumbs.db
+
+# --- IDE Dosyaları (VS Code, PyCharm vb.) ---
+.vscode/
+.idea/
+*.swp

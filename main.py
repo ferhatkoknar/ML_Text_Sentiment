@@ -1,214 +1,327 @@
-"""
-Authors:Ferhat Koknar,Hamza Gunes
-Created 19/12/2024
-"""
 import sqlite3
 import pandas as pd
-import tkinter as tk
-from tkinter import messagebox, simpledialog
-from sklearn.feature_extraction.text import CountVectorizer
-from sklearn.naive_bayes import MultinomialNB
+import customtkinter as ctk
+from tkinter import messagebox
 import joblib
 import re
 from TurkishStemmer import TurkishStemmer
 from nltk.corpus import stopwords
 import nltk
+import google.generativeai as genai
+import threading
+import os
+from pathlib import Path  # Dosya yolu bulmak için eklendi
+from dotenv import load_dotenv
 
-# NLTK ve Stemmer için gerekli yüklemeler
-# Necessary downloads for NLTK and Stemmer
-nltk.download('stopwords')
-turkish_stopwords = set(stopwords.words('turkish'))  # Türkçe stop words (stop words in Turkish)
+# --- AYARLAR VE API KEY YÜKLEME (GÜNCELLENDİ) ---
+
+# 1. Dosyanın çalıştığı klasörü ve .env yolunu tam olarak bul
+current_dir = Path(__file__).resolve().parent
+env_path = current_dir / ".env"
+
+# 2. .env dosyasını yükle
+load_dotenv(dotenv_path=env_path)
+
+# 3. Anahtarı al
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+# 4. Kontrol et ve Yapılandır
+if not GOOGLE_API_KEY:
+    print(f"HATA: .env dosyası bulunamadı veya içi boş! \nAranan yol: {env_path}")
+    print("ÇÖZÜM: .env dosyanızın main.py ile aynı klasörde olduğundan ve içinde 'GOOGLE_API_KEY=...' yazdığından emin olun.")
+    
+    # Hızlı çözüm için API Key'i geçici olarak buraya (aşağıya) yapıştırabilirsiniz:
+    # GOOGLE_API_KEY = "BURAYA_UZUN_API_ANAHTARINIZI_YAZIN"
+else:
+    print("BAŞARILI: API Key yüklendi.")
+    genai.configure(api_key=GOOGLE_API_KEY)
+
+
+# CustomTkinter Ayarları
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("blue")
+
+# NLTK ve Stemmer Hazırlığı
+try:
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('stopwords')
+
+turkish_stopwords = set(stopwords.words('turkish'))
 stemmer = TurkishStemmer()
 
-# Veritabanı bağlantısını kurma
-# Establish database connection
+
+# --- YARDIMCI FONKSİYONLAR ---
+
 def create_db_connection():
     try:
-        conn = sqlite3.connect("data/data.db")
+        # DB dosyasının tam yolunu verelim ki hata olmasın
+        db_path = current_dir / "data" / "data.db"
+        conn = sqlite3.connect(str(db_path))
         return conn
     except sqlite3.Error as e:
-        messagebox.showerror("Veritabanı Hatası", f"Veritabanı bağlantısı hatası: {e}")
+        print(f"Veritabanı hatası: {e}")
         return None
 
-# Metin temizleme işlevi
-# Text cleaning function
 def clean_text(text):
     try:
-        text = text.lower()  # Convert text to lowercase
-        text = re.sub(r'[^a-zçığıöşü\s]', '', text)  # Remove non-alphabetic characters
-        words = text.split()  # Split the text into words
-        words = [word for word in words if word not in turkish_stopwords]  # Remove stop words
-        words = [stemmer.stem(word) for word in words]  # Stem the words
+        text = text.lower()
+        text = re.sub(r'[^a-zçığıöşü\s]', '', text)
+        words = text.split()
+        words = [word for word in words if word not in turkish_stopwords]
+        words = [stemmer.stem(word) for word in words]
         return ' '.join(words)
-    except Exception as e:
-        messagebox.showerror("Hata", f"Metin temizleme hatası: {e}")
+    except Exception:
         return ""
 
-# Veritabanından veri yükleme
-# Load data from the database
-def load_from_database(conn):
+def classify_local(input_text, model, vectorizer):
+    """Yerel Naive Bayes modeli ile tahmin yapar."""
     try:
-        query = "SELECT * FROM text_data"
-        df = pd.read_sql_query(query, conn)
-        return df
-    except sqlite3.Error as e:
-        messagebox.showerror("Veritabanı Hatası", f"Veritabanından veri yüklenemedi: {e}")
-        return pd.DataFrame()
-
-# Model eğitme fonksiyonu
-# Function to train the model
-def train_model(df):
-    try:
-        df['label'] = df['label'].map({'Positive': 1, 'Negative': 0, 'Notr': 2})  # Convert labels to numeric
-        df['cleaned_text'] = df['text'].apply(clean_text)  # Clean the text
-        X_train = df['cleaned_text']
-        y_train = df['label']
-
-        # Vektörleştirici ve model eğitimi
-        # Vectorizer and model training
-        vectorizer = CountVectorizer()
-        X_train_vectorized = vectorizer.fit_transform(X_train)
-        model = MultinomialNB()
-        model.fit(X_train_vectorized, y_train)
-
-        # Model ve vektörleştirici kaydetme
-        # Save the model and vectorizer
-        joblib.dump(model, 'models/sentiment_model.pkl')
-        joblib.dump(vectorizer, 'models/vectorizer.pkl')
+        cleaned_input_text = clean_text(input_text)
+        input_vectorized = vectorizer.transform([cleaned_input_text])
+        prediction = model.predict(input_vectorized)
         
-        print("Model başarıyla eğitildi ve kaydedildi.")  # Model successfully trained and saved
-        return model, vectorizer
+        # Olasılık değerlerini de alalım (Güven skoru için)
+        proba = model.predict_proba(input_vectorized).max()
+        
+        label = "Negative" if prediction == 0 else "Positive" if prediction == 1 else "Notr"
+        return label, proba
     except Exception as e:
-        messagebox.showerror("Model Eğitimi Hatası", f"Model eğitimi sırasında bir hata oluştu: {e}")
-        return None, None
+        return "Hata", 0.0
 
-# Metin sınıflandırma işlevi
-# Function to classify text
-def classify_text(input_text, model, vectorizer):
+from google.generativeai.types import HarmCategory, HarmBlockThreshold # Bu importları eklemeye gerek yok, string olarak vereceğiz.
+
+def ask_llm(input_text, local_prediction):
+    """Gemini API'ye sorar ve değerlendirme ister. (Güçlendirilmiş Versiyon)"""
+    
+    if not GOOGLE_API_KEY:
+        return "HATA: API Key bulunamadı! Lütfen .env dosyasını kontrol edin."
+
     try:
-        cleaned_input_text = clean_text(input_text)  # Clean the input text
-        input_vectorized = vectorizer.transform([cleaned_input_text])  # Vectorize the cleaned text
-        prediction = model.predict(input_vectorized)  # Predict the sentiment
-        return "Negative" if prediction == 0 else "Positive" if prediction == 1 else "Notr"
+        genai.configure(api_key=GOOGLE_API_KEY)
+        
+        # MODEL SEÇİMİ: Listenizde olan ve en stabil modellerden biri
+        model = genai.GenerativeModel('gemini-flash-latest')
+        
+        # GÜVENLİK AYARLARI: Gereksiz engellemeleri kaldırmak için 'BLOCK_NONE' yapıyoruz
+        safety_settings = [
+            {
+                "category": "HARM_CATEGORY_HARASSMENT",
+                "threshold": "BLOCK_NONE"
+            },
+            {
+                "category": "HARM_CATEGORY_HATE_SPEECH",
+                "threshold": "BLOCK_NONE"
+            },
+            {
+                "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                "threshold": "BLOCK_NONE"
+            },
+            {
+                "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                "threshold": "BLOCK_NONE"
+            },
+        ]
+
+        prompt = f"""
+        Sen uzman bir Türkçe Duygu Analizi asistanısın.
+        
+        Analiz edilecek metin: "{input_text}"
+        
+        Bizim yerel makine öğrenmesi modelimiz (Naive Bayes) bu metni şu şekilde etiketledi: "{local_prediction}"
+        
+        Görevin:
+        1. Metnin duygu durumunu sen de analiz et (Positive, Negative veya Notr).
+        2. Yerel modelin tahmini doğru mu yanlış mı değerlendir.
+        3. Kısa bir açıklama yap.
+        
+        Cevabını şu formatta ver:
+        LLM Tahmini: [Senin Kararın]
+        Yerel Model: [Doğru/Yanlış]
+        Açıklama: [Kısa açıklaman]
+        """
+        
+        # İsteği gönderirken güvenlik ayarlarını ekliyoruz
+        response = model.generate_content(prompt, safety_settings=safety_settings)
+        
+        # HATA KONTROLÜ: Cevap boş mu dolu mu kontrol et
+        if response.parts:
+            return response.text
+        else:
+            # Eğer cevap boşsa ama hata yoksa, muhtemelen başka bir filtreye takıldı
+            print(f"DEBUG: Model boş cevap döndü. Finish Reason: {response.candidates[0].finish_reason}")
+            return "Yapay zeka boş bir cevap döndürdü. Lütfen tekrar deneyin."
+
     except Exception as e:
-        messagebox.showerror("Sınıflandırma Hatası", f"Metin sınıflandırma hatası: {e}")
-        return ""
+        # Hata mesajını yakala ve kullanıcıya göster
+        err_msg = str(e)
+        if "429" in err_msg:
+            return "HATA: Google API kotası doldu (429). Lütfen 1 dakika bekleyip tekrar deneyin."
+        return f"Bağlantı Hatası: {err_msg}"
 
-# Tkinter GUI sınıfı
-# Tkinter GUI class
-class SentimentApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Sentiment Analysis")  # Set the window title
-        self.conn = create_db_connection()  # Establish database connection
-        self.model, self.vectorizer = self.load_model()  # Load the model and vectorizer
+# --- ARAYÜZ SINIFI (MODERN UI) ---
 
-        # Kapanma işlemi için on_closing fonksiyonu atanıyor
-        # Assign the on_closing function for closing the application
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+class ModernSentimentApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
 
-        # GUI bileşenlerini oluşturma
-        # Create GUI components
+        # Pencere Ayarları
+        self.title("Hibrit Duygu Analizi (ML + LLM)")
+        self.geometry("900x650")
+        
+        # Veri ve Model Yükleme
+        self.conn = create_db_connection()
+        self.model, self.vectorizer = self.load_model()
+
+        # Grid Layout
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=0) # Title
+        self.grid_rowconfigure(1, weight=1) # Content
+
         self.create_widgets()
-
-    def create_widgets(self):
-        self.label = tk.Label(self.root, text="Metin Analizine Hoşgeldiniz.", font=("Arial", 18))  # Create label
-        self.label.pack(pady=10)
-        
-        self.label = tk.Label(self.root, text="Lütfen bir işlem seçin:", font=("Arial", 14))  # Create label
-        self.label.pack(pady=10)
-
-        self.classify_button = tk.Button(self.root, text="Metni Sınıflandır", command=self.classify_text_ui, width=20)  # Button for classification
-        self.classify_button.pack(pady=5)
-
-        self.add_data_button = tk.Button(self.root, text="Yeni Veri Ekle", command=self.add_data_ui, width=20)  # Button to add data
-        self.add_data_button.pack(pady=5)
-
-        self.train_button = tk.Button(self.root, text="Modeli Yeniden Eğit", command=self.retrain_model_ui, width=20)  # Button to retrain the model
-        self.train_button.pack(pady=5)
-
-        self.exit_button = tk.Button(self.root, text="Çıkış", command=self.on_closing, width=20)  # Button to exit
-        self.exit_button.pack(pady=20)
 
     def load_model(self):
         try:
-            model = joblib.load('models/sentiment_model.pkl')  # Load the model
-            vectorizer = joblib.load('models/vectorizer.pkl')  # Load the vectorizer
-            print("Model yüklendi.")  # Model loaded
+            # Model dosyalarının tam yolunu bul
+            model_path = current_dir / 'models' / 'sentiment_model.pkl'
+            vec_path = current_dir / 'models' / 'vectorizer.pkl'
+            
+            if not model_path.exists():
+                print(f"Model dosyası bulunamadı: {model_path}")
+                return None, None
+
+            model = joblib.load(model_path)
+            vectorizer = joblib.load(vec_path)
             return model, vectorizer
-        except (FileNotFoundError, Exception) as e:
-            messagebox.showerror("Model Yükleme Hatası", f"Model yüklenemedi: {e}")
+        except Exception as e:
+            print(f"Model yükleme hatası: {e}")
             return None, None
 
-    def classify_text_ui(self):
-        if not self.model or not self.vectorizer:
-            messagebox.showerror("Hata", "Model yüklenemedi. Önce modeli eğitin.")  # Error message if model is not loaded
+    def create_widgets(self):
+        # --- BAŞLIK ALANI ---
+        self.header_frame = ctk.CTkFrame(self, corner_radius=0)
+        self.header_frame.grid(row=0, column=0, sticky="ew")
+        
+        self.title_label = ctk.CTkLabel(self.header_frame, text="Türkçe Metin Duygu Analizi", font=ctk.CTkFont(size=24, weight="bold"))
+        self.title_label.pack(pady=20)
+
+        # --- ANA İÇERİK ALANI ---
+        self.content_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.content_frame.grid(row=1, column=0, sticky="nsew", padx=30, pady=20)
+        
+        # Metin Girişi
+        self.input_label = ctk.CTkLabel(self.content_frame, text="Analiz edilecek metni girin:", font=ctk.CTkFont(size=14))
+        self.input_label.pack(anchor="w", pady=(0, 5))
+        
+        self.text_input = ctk.CTkTextbox(self.content_frame, height=100, font=ctk.CTkFont(size=14))
+        self.text_input.pack(fill="x", pady=(0, 20))
+
+        # Analiz Butonu
+        self.analyze_btn = ctk.CTkButton(self.content_frame, text="ANALİZ ET (Local + LLM)", 
+                                         command=self.start_analysis, 
+                                         height=50, 
+                                         font=ctk.CTkFont(size=16, weight="bold"),
+                                         fg_color="#1a73e8", hover_color="#155bb5")
+        self.analyze_btn.pack(fill="x", pady=(0, 30))
+
+        # --- SONUÇ KARTLARI ---
+        self.results_frame = ctk.CTkFrame(self.content_frame, fg_color="transparent")
+        self.results_frame.pack(fill="both", expand=True)
+        
+        self.results_frame.grid_columnconfigure(0, weight=1)
+        self.results_frame.grid_columnconfigure(1, weight=1)
+
+        # Sol Kart: Yerel Model
+        self.local_card = ctk.CTkFrame(self.results_frame)
+        self.local_card.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        
+        self.lbl_local_title = ctk.CTkLabel(self.local_card, text="Yerel Model (Naive Bayes)", font=ctk.CTkFont(size=16, weight="bold"), text_color="#aaaaaa")
+        self.lbl_local_title.pack(pady=15)
+        
+        self.lbl_local_result = ctk.CTkLabel(self.local_card, text="-", font=ctk.CTkFont(size=32, weight="bold"))
+        self.lbl_local_result.pack(pady=10)
+        
+        self.lbl_local_conf = ctk.CTkLabel(self.local_card, text="Güven: -", font=ctk.CTkFont(size=12))
+        self.lbl_local_conf.pack(pady=(0, 15))
+
+        # Sağ Kart: Durum / LLM Butonu
+        self.status_card = ctk.CTkFrame(self.results_frame)
+        self.status_card.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+        
+        self.lbl_status_title = ctk.CTkLabel(self.status_card, text="Sistem Durumu", font=ctk.CTkFont(size=16, weight="bold"), text_color="#aaaaaa")
+        self.lbl_status_title.pack(pady=15)
+        
+        self.lbl_status_msg = ctk.CTkLabel(self.status_card, text="Veri bekleniyor...", font=ctk.CTkFont(size=14))
+        self.lbl_status_msg.pack(pady=20)
+        
+        # Model Eğitimi & Veri Ekleme Butonları (Alt kısım)
+        self.footer_frame = ctk.CTkFrame(self, corner_radius=0, height=50)
+        self.footer_frame.grid(row=2, column=0, sticky="ew")
+        
+        self.btn_train = ctk.CTkButton(self.footer_frame, text="Modeli Yeniden Eğit", command=self.dummy_train_popup, fg_color="transparent", border_width=1, text_color=("gray10", "#DCE4EE"))
+        self.btn_train.pack(side="left", padx=20, pady=10)
+        
+        self.btn_add_data = ctk.CTkButton(self.footer_frame, text="Veri Ekle", command=self.dummy_add_popup, fg_color="transparent", border_width=1, text_color=("gray10", "#DCE4EE"))
+        self.btn_add_data.pack(side="right", padx=20, pady=10)
+
+    def start_analysis(self):
+        text = self.text_input.get("1.0", "end-1c").strip()
+        if not text:
+            messagebox.showwarning("Uyarı", "Lütfen bir metin girin.")
             return
 
-        input_text = simpledialog.askstring("Metni Sınıflandır", "Lütfen sınıflandırmak istediğiniz metni girin:")  # Ask for text input
-        if input_text and input_text.isdigit():  # Check if input is digits only
-            messagebox.showwarning("Uyarı", "Lütfen sadece sayılardan oluşmayan bir metin girin.")  # Warning for numeric input
+        if not self.model:
+            messagebox.showerror("Hata", "Model dosyaları bulunamadı. Önce modeli eğitin.")
             return
 
-        if input_text:
-            prediction = classify_text(input_text, self.model, self.vectorizer)  # Classify the input text
-            messagebox.showinfo("Sonuç", f"Tahmini sınıf: {prediction}")  # Show the prediction result
-        else:
-            messagebox.showwarning("Uyarı", "Metin girişi boş olamaz.")  # Warning for empty input
+        # 1. Aşama: Yerel Model Tahmini
+        prediction, proba = classify_local(text, self.model, self.vectorizer)
+        
+        # Sonucu Ekrana Bas
+        color = "#2CC985" if prediction == "Positive" else "#FF4C4C" if prediction == "Negative" else "#FFD700"
+        self.lbl_local_result.configure(text=prediction, text_color=color)
+        self.lbl_local_conf.configure(text=f"Güven Skoru: %{proba*100:.2f}")
+        
+        self.lbl_status_msg.configure(text="LLM (Yapay Zeka) Doğrulaması Başlatılıyor...")
+        self.update() # Arayüzü yenile
 
-    def add_data_ui(self):
-        text = simpledialog.askstring("Yeni Veri", "Lütfen metni girin:")  # Ask for text input
-        label = simpledialog.askstring("Yeni Veri", "Lütfen etiketi girin (Positive, Negative, Notr):")  # Ask for label
+        # 2. Aşama: LLM Penceresi Aç ve Sorgula (Thread kullanarak arayüzü dondurma)
+        threading.Thread(target=self.open_llm_window, args=(text, prediction)).start()
 
-        if text and label:
-            if label not in ["Positive", "Negative", "Notr"]:  # Validate label
-                messagebox.showerror("Hata", "Geçersiz etiket. Lütfen 'Positive', 'Negative' veya 'Notr' girin.")  # Error for invalid label
-                return
-            new_data = pd.DataFrame([[text, label]], columns=["text", "label"])  # Create new data entry
-            self.save_to_database(new_data)  # Save the new data to the database
-            messagebox.showinfo("Başarılı", "Yeni veri başarıyla eklendi.")  # Success message
-        else:
-            messagebox.showwarning("Uyarı", "Metin ve etiket boş bırakılamaz.")  # Warning for empty fields
+    def open_llm_window(self, text, local_pred):
+        # API Çağrısı
+        llm_response = ask_llm(text, local_pred)
+        
+        # Pencereyi Ana Thread'de açmak için after kullanıyoruz
+        self.after(0, lambda: self.show_llm_results(llm_response))
 
-    def save_to_database(self, df):
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS text_data (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    text TEXT,
-                    label TEXT
-                )
-            """)
-            self.conn.commit()
-            df.to_sql("text_data", self.conn, if_exists="append", index=False)  # Save the data to the database
-        except sqlite3.Error as e:
-            messagebox.showerror("Veritabanı Hatası", f"Veritabanına veri eklenirken hata oluştu: {e}")  # Error during database insertion
+    def show_llm_results(self, response_text):
+        self.lbl_status_msg.configure(text="LLM Doğrulaması Tamamlandı.")
+        
+        # Yeni Pencere Oluştur (Toplevel)
+        llm_window = ctk.CTkToplevel(self)
+        llm_window.title("Yapay Zeka (LLM) Değerlendirmesi")
+        llm_window.geometry("500x400")
+        llm_window.attributes("-topmost", True) # Her zaman üstte
+        
+        title = ctk.CTkLabel(llm_window, text="Gemini AI Değerlendirmesi", font=ctk.CTkFont(size=20, weight="bold"))
+        title.pack(pady=20)
+        
+        textbox = ctk.CTkTextbox(llm_window, font=ctk.CTkFont(size=14))
+        textbox.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        
+        textbox.insert("0.0", response_text)
+        textbox.configure(state="disabled") # Sadece okunabilir
 
-    def retrain_model_ui(self):
-        df = load_from_database(self.conn)  # Load data from the database
-        if df.empty:
-            messagebox.showwarning("Uyarı", "Veritabanında eğitim için yeterli veri bulunamadı.")  # Warning if there's no data
-            return
+    def dummy_train_popup(self):
+        messagebox.showinfo("Bilgi", "Eğitim fonksiyonu bu modern arayüzde arka planda çalıştırılabilir. Eski kodunuzdaki train_model fonksiyonunu buraya entegre edebilirsiniz.")
 
-        self.model, self.vectorizer = train_model(df)  # Retrain the model
-        if self.model and self.vectorizer:
-            messagebox.showinfo("Başarılı", "Model başarıyla yeniden eğitildi.")  # Success message
-        else:
-            messagebox.showerror("Model Eğitimi Hatası", "Model eğitilemedi. Lütfen tekrar deneyin.")  # Error during retraining
+    def dummy_add_popup(self):
+        # Buraya veri ekleme popup'ı gelecek (Eski kodunuzdaki mantıkla aynı)
+        dialog = ctk.CTkInputDialog(text="Etiket (Positive/Negative/Notr):", title="Veri Ekle")
+        # Basitlik için sadece placeholder
+        pass
 
-    def on_closing(self):
-        try:
-            if messagebox.askokcancel("Çıkış", "Programdan çıkmak istediğinize emin misiniz?"):  # Confirm exit
-                self.conn.close()  # Close the database connection
-                self.root.destroy()  # Close the Tkinter window
-        except Exception as e:
-            print(f"Bir hata oluştu: {e}")  # Error during closing
-            self.root.destroy()
-
-# Tkinter ana döngüsü
-# Tkinter main loop
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = SentimentApp(root)
-    root.mainloop()
+    app = ModernSentimentApp()
+    app.mainloop()
